@@ -1,10 +1,9 @@
 const db = require("../models");
 const Tutorial = db.tutorials;
+const Tag = db.tags;
 const Op = db.Sequelize.Op;
 
-// Create and Save a new Tutorial
 exports.create = (req, res) => {
-  // Validate request
   if (!req.body.title) {
     res.status(400).send({
       message: "Content can not be empty!"
@@ -12,14 +11,12 @@ exports.create = (req, res) => {
     return;
   }
 
-  // Create a Tutorial
   const tutorial = {
     title: req.body.title,
     description: req.body.description,
     published: req.body.published ? req.body.published : false
   };
 
-  // Save Tutorial in the database
   Tutorial.create(tutorial)
     .then(data => {
       res.send(data);
@@ -32,12 +29,46 @@ exports.create = (req, res) => {
     });
 };
 
-// Retrieve all Tutorials from the database.
 exports.findAll = (req, res) => {
   const title = req.query.title;
-  var condition = title ? { title: { [Op.like]: `%${title}%` } } : null;
+  const published = req.query.published;
+  const tagsParam = req.query.tags;
 
-  Tutorial.findAll({ where: condition })
+  var condition = {};
+
+  if (title) {
+    condition.title = { [Op.like]: `%${title}%` };
+  }
+
+  if (published !== undefined) {
+    condition.published = published === 'true';
+  }
+
+  var includeOptions = [];
+
+  if (tagsParam) {
+    const tagIds = tagsParam.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
+    
+    if (tagIds.length > 0) {
+      includeOptions.push({
+        model: Tag,
+        as: "tags",
+        where: {
+          id: {
+            [Op.in]: tagIds
+          }
+        },
+        through: { attributes: [] },
+        required: true
+      });
+    }
+  }
+
+  Tutorial.findAll({ 
+    where: Object.keys(condition).length > 0 ? condition : null,
+    include: includeOptions.length > 0 ? includeOptions : undefined,
+    distinct: true
+  })
     .then(data => {
       res.send(data);
     })
@@ -49,11 +80,16 @@ exports.findAll = (req, res) => {
     });
 };
 
-// Find a single Tutorial with an id
 exports.findOne = (req, res) => {
   const id = req.params.id;
 
-  Tutorial.findByPk(id)
+  Tutorial.findByPk(id, {
+    include: [{
+      model: Tag,
+      as: "tags",
+      through: { attributes: [] }
+    }]
+  })
     .then(data => {
       if (data) {
         res.send(data);
@@ -70,7 +106,6 @@ exports.findOne = (req, res) => {
     });
 };
 
-// Update a Tutorial by the id in the request
 exports.update = (req, res) => {
   const id = req.params.id;
 
@@ -95,7 +130,6 @@ exports.update = (req, res) => {
     });
 };
 
-// Delete a Tutorial with the specified id in the request
 exports.delete = (req, res) => {
   const id = req.params.id;
 
@@ -120,7 +154,6 @@ exports.delete = (req, res) => {
     });
 };
 
-// Delete all Tutorials from the database.
 exports.deleteAll = (req, res) => {
   Tutorial.destroy({
     where: {},
@@ -137,7 +170,6 @@ exports.deleteAll = (req, res) => {
     });
 };
 
-// find all published Tutorial
 exports.findAllPublished = (req, res) => {
   Tutorial.findAll({ where: { published: true } })
     .then(data => {
@@ -149,4 +181,136 @@ exports.findAllPublished = (req, res) => {
           err.message || "Some error occurred while retrieving tutorials."
       });
     });
+};
+
+exports.setTags = (req, res) => {
+  const id = req.params.id;
+  const tagIds = req.body.tagIds || [];
+
+  if (!Array.isArray(tagIds)) {
+    res.status(400).send({
+      message: "tagIds must be an array!"
+    });
+    return;
+  }
+
+  Tutorial.findByPk(id)
+    .then(tutorial => {
+      if (!tutorial) {
+        res.status(404).send({
+          message: `Cannot find Tutorial with id=${id}.`
+        });
+        return;
+      }
+
+      if (tagIds.length === 0) {
+        return tutorial.setTags([]).then(() => {
+          res.send({ message: "Tags cleared successfully." });
+        });
+      }
+
+      return Tag.findAll({
+        where: {
+          id: {
+            [Op.in]: tagIds
+          }
+        }
+      }).then(tags => {
+        if (tags.length !== tagIds.length) {
+          res.status(400).send({
+            message: "Some tag IDs are invalid."
+          });
+          return;
+        }
+
+        return tutorial.setTags(tags).then(() => {
+          res.send({ message: "Tags set successfully." });
+        });
+      });
+    })
+    .catch(err => {
+      res.status(500).send({
+        message: "Error setting tags for Tutorial with id=" + id
+      });
+    });
+};
+
+exports.batch = (req, res) => {
+  const { action, ids, published } = req.body;
+
+  if (!ids || !Array.isArray(ids)) {
+    res.status(400).send({
+      message: "ids must be an array!"
+    });
+    return;
+  }
+
+  if (ids.length > 100) {
+    res.status(400).send({
+      message: "Maximum 100 IDs allowed per batch operation."
+    });
+    return;
+  }
+
+  if (ids.length === 0) {
+    res.status(400).send({
+      message: "ids array cannot be empty."
+    });
+    return;
+  }
+
+  if (action !== "delete" && action !== "updatePublished") {
+    res.status(400).send({
+      message: "Invalid action. Must be 'delete' or 'updatePublished'."
+    });
+    return;
+  }
+
+  if (action === "updatePublished" && published === undefined) {
+    res.status(400).send({
+      message: "published field is required for updatePublished action."
+    });
+    return;
+  }
+
+  const t = db.sequelize.transaction();
+
+  t.then(transaction => {
+    if (action === "delete") {
+      return Tutorial.destroy({
+        where: { id: { [Op.in]: ids } },
+        transaction
+      }).then(() => {
+        return transaction.commit();
+      }).catch(err => {
+        return transaction.rollback().then(() => {
+          throw err;
+        });
+      });
+    } else {
+      return Tutorial.update(
+        { published: published },
+        { 
+          where: { id: { [Op.in]: ids } },
+          transaction
+        }
+      ).then(() => {
+        return transaction.commit();
+      }).catch(err => {
+        return transaction.rollback().then(() => {
+          throw err;
+        });
+      });
+    }
+  }).then(() => {
+    if (action === "delete") {
+      res.send({ message: `${ids.length} tutorials deleted successfully.` });
+    } else {
+      res.send({ message: `${ids.length} tutorials updated successfully.` });
+    }
+  }).catch(err => {
+    res.status(500).send({
+      message: err.message || "Some error occurred during batch operation."
+    });
+  });
 };
